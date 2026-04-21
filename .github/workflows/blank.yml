@@ -1,11 +1,148 @@
-name: Smoke CI
+name: Tests
 
 on:
   workflow_dispatch:
+    inputs:
+      sut_repo:
+        description: "Git URL do repositório da aplicação alvo (repo A)"
+        required: true
+        type: string
+      run_e2e:
+        description: "Executar testes E2E"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  smoke:
+  backend-unit:
     runs-on: ubuntu-latest
     steps:
-      - name: Echo
-        run: echo "Workflow OK"
+      - name: Checkout testes
+        uses: actions/checkout@v4
+
+      - name: Clone SUT (repo A)
+        run: git clone "${{ inputs.sut_repo }}" ExameDesenvolvedorDeTestes
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Run backend unit tests
+        run: dotnet test tests/backend/unit/Backend.UnitTests/Backend.UnitTests.csproj --configuration Release
+
+  backend-integration:
+    runs-on: ubuntu-latest
+    needs: backend-unit
+    steps:
+      - name: Checkout testes
+        uses: actions/checkout@v4
+
+      - name: Clone SUT (repo A)
+        run: git clone "${{ inputs.sut_repo }}" ExameDesenvolvedorDeTestes
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Start API
+        run: |
+          dotnet restore ExameDesenvolvedorDeTestes/ExameDesenvolvedorDeTestes/api/MinhasFinancas.API/MinhasFinancas.API.csproj
+          nohup dotnet run --project ExameDesenvolvedorDeTestes/ExameDesenvolvedorDeTestes/api/MinhasFinancas.API/MinhasFinancas.API.csproj --urls "http://localhost:5135" >/tmp/api.log 2>&1 &
+
+      - name: Wait API health
+        run: |
+          for i in {1..30}; do
+            if curl -sf "http://localhost:5135/swagger/index.html" >/dev/null; then
+              echo "API pronta"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API nao respondeu a tempo"
+          cat /tmp/api.log
+          exit 1
+
+      - name: Run backend integration tests
+        env:
+          BASE_API_URL: http://localhost:5135
+        run: dotnet test tests/backend/integration/Backend.IntegrationTests/Backend.IntegrationTests.csproj --configuration Release
+
+  frontend-unit:
+    runs-on: ubuntu-latest
+    needs: backend-unit
+    steps:
+      - name: Checkout testes
+        uses: actions/checkout@v4
+
+      - name: Clone SUT (repo A)
+        run: git clone "${{ inputs.sut_repo }}" ExameDesenvolvedorDeTestes
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: tests/frontend/unit/package-lock.json
+
+      - name: Install frontend unit dependencies
+        run: npm --prefix tests/frontend/unit ci
+
+      - name: Run frontend unit tests
+        run: npm --prefix tests/frontend/unit test
+
+  e2e:
+    if: ${{ inputs.run_e2e == true }}
+    runs-on: ubuntu-latest
+    needs: [backend-integration, frontend-unit]
+    steps:
+      - name: Checkout testes
+        uses: actions/checkout@v4
+
+      - name: Clone SUT (repo A)
+        run: git clone "${{ inputs.sut_repo }}" ExameDesenvolvedorDeTestes
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install SUT web dependencies
+        run: npm --prefix ExameDesenvolvedorDeTestes/ExameDesenvolvedorDeTestes/web ci
+
+      - name: Install E2E dependencies
+        run: npm --prefix tests/e2e ci
+
+      - name: Install Playwright browser
+        run: npx --prefix tests/e2e playwright install --with-deps chromium
+
+      - name: Start API
+        run: |
+          nohup dotnet run --project ExameDesenvolvedorDeTestes/ExameDesenvolvedorDeTestes/api/MinhasFinancas.API/MinhasFinancas.API.csproj --urls "http://localhost:5135" >/tmp/api.log 2>&1 &
+
+      - name: Start web
+        run: |
+          nohup env VITE_API_URL="http://localhost:5135/api/v1.0" npx --prefix ExameDesenvolvedorDeTestes/ExameDesenvolvedorDeTestes/web vite --host 0.0.0.0 --port 5175 >/tmp/web.log 2>&1 &
+
+      - name: Wait services
+        run: |
+          for i in {1..40}; do
+            curl -sf "http://localhost:5135/swagger/index.html" >/dev/null && curl -sf "http://localhost:5175" >/dev/null && exit 0
+            sleep 2
+          done
+          echo "Servicos nao subiram."
+          cat /tmp/api.log || true
+          cat /tmp/web.log || true
+          exit 1
+
+      - name: Run E2E tests
+        env:
+          BASE_WEB_URL: http://localhost:5175
+        run: npm --prefix tests/e2e test
